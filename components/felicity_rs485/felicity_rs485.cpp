@@ -13,6 +13,7 @@ static constexpr uint32_t RESPONSE_TIMEOUT_MS = 500;
 static constexpr uint32_t FRAME_SILENCE_MS = 20;
 static constexpr uint32_t INTER_FRAME_GAP_MS = 120;
 static constexpr uint32_t CAN_TX_PERIOD_MS = 1000;
+static constexpr uint32_t CAN_FRAME_GAP_MS = 100;
 static constexpr uint32_t BRIDGE_DATA_MAX_AGE_MS = 60000;
 
 static const FelicityRS485::Block BLOCKS[] = {
@@ -271,7 +272,11 @@ void FelicityRS485::transmit_deye_frames_() {
   if (!this->bridge_enabled_ || this->canbus_ == nullptr || this->packs_.size() != 2)
     return;
   const uint32_t now = millis();
-  if (now - this->last_can_tx_at_ < CAN_TX_PERIOD_MS)
+  if (!time_reached(this->can_retry_at_))
+    return;
+  if (this->can_frame_index_ == 0 && now - this->last_can_cycle_at_ < CAN_TX_PERIOD_MS)
+    return;
+  if (this->can_frame_index_ != 0 && now - this->last_can_tx_at_ < CAN_FRAME_GAP_MS)
     return;
 
   // Require recent telemetry, limits, and alarm words from both packs. Never
@@ -329,26 +334,16 @@ void FelicityRS485::transmit_deye_frames_() {
     data[offset] = v & 0xFF;
     data[offset + 1] = v >> 8;
   };
-  auto send = [this](uint32_t id, const std::vector<uint8_t> &data) {
-    auto result = this->canbus_->send_data(id, false, false, data);
-    if (result != canbus::ERROR_OK)
-      ESP_LOGW(TAG, "Deye CAN TX 0x%03X failed (%d)", static_cast<unsigned>(id), static_cast<int>(result));
-  };
-
   std::vector<uint8_t> limits(8, 0);
   write_u16(limits, 0, std::lround(charge_voltage_limit * 10));
   write_u16(limits, 2, std::lround(charge_current_limit * 10));
   write_u16(limits, 4, std::lround(discharge_current_limit * 10));
   write_u16(limits, 6, std::lround(discharge_voltage_limit * 10));
-  send(0x351, limits);
-
   std::vector<uint8_t> soc_soh(8, 0);
   write_u16(soc_soh, 0, std::lround(weighted_soc / total_capacity));
   // Felicity returned zero design-capacity registers, so SOH is unknown.
   // Keep the protocol field explicitly zero rather than making up a value.
   write_u16(soc_soh, 2, 0);
-  send(0x355, soc_soh);
-
   std::vector<uint8_t> telemetry(8, 0);
   // Deye's 0x356 voltage field is in 0.01 V units.
   write_u16(telemetry, 0, std::lround((total_voltage / this->packs_.size()) * 100.0f));
@@ -359,8 +354,6 @@ void FelicityRS485::transmit_deye_frames_() {
   int16_t temp_degrees = static_cast<int16_t>(std::lround((total_temperature / temperature_count) * 10));
   telemetry[4] = static_cast<uint8_t>(temp_degrees & 0xFF);
   telemetry[5] = static_cast<uint8_t>((static_cast<uint16_t>(temp_degrees) >> 8) & 0xFF);
-  send(0x356, telemetry);
-
   // We do not yet have a verified bit-by-bit Felicity-to-Deye alarm mapping.
   // Assert only the generic system-error bit when any raw BMS alarm/protection is active.
   std::vector<uint8_t> alarms(8, 0);
@@ -368,12 +361,22 @@ void FelicityRS485::transmit_deye_frames_() {
   alarms[4] = 'N';
   alarms[5] = 'P';
   alarms[6] = static_cast<uint8_t>(this->packs_.size());
-  send(0x359, alarms);
-
   std::vector<uint8_t> brand{'F', 'e', 'l', 'i', 'c', 'i', 't', 'y'};
-  send(0x35E, brand);
-
+  static constexpr uint32_t CAN_IDS[] = {0x351, 0x355, 0x356, 0x359, 0x35E};
+  const std::vector<uint8_t> *frames[] = {&limits, &soc_soh, &telemetry, &alarms, &brand};
+  auto result = this->canbus_->send_data(CAN_IDS[this->can_frame_index_], false, false,
+                                         *frames[this->can_frame_index_]);
+  if (result != canbus::ERROR_OK) {
+    ESP_LOGW(TAG, "Deye CAN TX 0x%03X failed (%d); retrying after 1s",
+             static_cast<unsigned>(CAN_IDS[this->can_frame_index_]), static_cast<int>(result));
+    this->last_can_tx_at_ = now;
+    this->can_retry_at_ = now + CAN_TX_PERIOD_MS;
+    return;
+  }
   this->last_can_tx_at_ = now;
+  if (this->can_frame_index_ == 0)
+    this->last_can_cycle_at_ = now;
+  this->can_frame_index_ = (this->can_frame_index_ + 1) % 5;
 }
 
 void FelicityRS485::finish_request_(bool success) {

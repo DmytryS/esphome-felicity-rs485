@@ -205,6 +205,9 @@ class FelicityRS485 : public PollingComponent, public uart::UARTDevice {
   canbus::Canbus *canbus_{nullptr};
   bool bridge_enabled_{false};
   uint32_t last_can_tx_at_{0};
+  uint32_t last_can_cycle_at_{0};
+  uint32_t can_retry_at_{0};
+  uint8_t can_frame_index_{0};
   std::vector<FelicityPack> packs_;
   std::vector<uint8_t> rx_buffer_;
   size_t pack_index_{0};
