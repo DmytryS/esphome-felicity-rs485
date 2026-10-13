@@ -1,0 +1,68 @@
+# Minimal standalone USB bench test. Replaces the Felicity/CAN firmware.
+# No Wi-Fi, CAN, battery polling, setting changes or time-sync writes.
+# WeAct FPC breakout position 15 = GPIO16 -> adapter DI.
+# Adapter RO -> breakout position 16 = GPIO18.
+# Assumes an external 3.3 V-compatible auto-direction RS485 adapter.
+# If the adapter requires DE/RE, confirm and configure a separate spare pin.
+esphome:
+  name: deye-rs485-usb-test
+  friendly_name: Deye RS485 USB Test
+
+esp32:
+  board: esp32dev
+  flash_size: 8MB
+  framework:
+    type: arduino
+
+logger:
+  level: DEBUG
+  baud_rate: 115200
+  hardware_uart: UART0
+
+uart:
+  id: deye_uart
+  tx_pin: GPIO16
+  rx_pin: GPIO18
+  baud_rate: 9600
+  data_bits: 8
+  parity: NONE
+  stop_bits: 1
+  rx_buffer_size: 256
+  debug:
+    direction: BOTH
+    dummy_receiver: false
+    after:
+      timeout: 50ms
+    sequence:
+      - lambda: UARTDebug::log_hex(direction, bytes, ' ');
+
+modbus:
+  id: deye_modbus
+  uart_id: deye_uart
+  send_wait_time: 1000ms
+
+modbus_controller:
+  - id: deye_inverter
+    address: 1
+    modbus_id: deye_modbus
+    update_interval: 5s
+    max_cmd_retries: 1
+
+sensor:
+  - platform: modbus_controller
+    modbus_controller_id: deye_inverter
+    id: deye_battery_voltage
+    name: Deye Battery Voltage
+    register_type: holding
+    address: 183
+    value_type: U_WORD
+    unit_of_measurement: V
+    device_class: voltage
+    state_class: measurement
+    accuracy_decimals: 2
+    filters:
+      - multiply: 0.01
+    on_value:
+      then:
+        - lambda: |-
+            ESP_LOGI("deye_probe", "DEYE REPLY: register 183 = %.2f V", x);

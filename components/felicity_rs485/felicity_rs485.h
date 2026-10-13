@@ -31,6 +31,11 @@ struct FelicityPack {
   int16_t discharge_current_raw{0};
   uint16_t voltage_raw{0};
   uint16_t soc_raw{0};
+  uint16_t native_soc_tenths{0};
+  uint16_t native_soh_tenths{0};
+  uint32_t native_capacity_mah{0};
+  uint32_t native_status_updated_at{0};
+  bool native_status_valid{false};
   uint32_t full_capacity_raw{0};
   uint16_t packs_online_raw{0};
   uint16_t charge_alarm_raw{0};
@@ -120,6 +125,8 @@ class FelicityRS485 : public PollingComponent, public uart::UARTDevice {
   void set_direction_pin(InternalGPIOPin *pin) { this->direction_pin_ = pin; }
   void set_canbus(canbus::Canbus *canbus) { this->canbus_ = canbus; }
   void set_bridge_enabled(bool enabled) { this->bridge_enabled_ = enabled; }
+  void set_can_diagnostics_enabled(bool enabled) { this->can_diagnostics_enabled_ = enabled; }
+  void set_can_diagnostic_send_test(bool enabled) { this->can_diagnostic_send_test_ = enabled; }
   void add_pack(uint8_t address);
 
 #define FELICITY_DECLARE_SENSOR_SETTER(NAME, MEMBER) \
@@ -204,6 +211,11 @@ class FelicityRS485 : public PollingComponent, public uart::UARTDevice {
   InternalGPIOPin *direction_pin_{nullptr};
   canbus::Canbus *canbus_{nullptr};
   bool bridge_enabled_{false};
+  bool can_diagnostics_enabled_{false};
+  bool can_diagnostic_send_test_{false};
+  bool can_diagnostic_test_sent_{false};
+  uint32_t can_diagnostic_started_at_{0};
+  uint32_t can_diagnostic_next_status_at_{0};
   uint32_t last_can_tx_at_{0};
   uint32_t last_can_cycle_at_{0};
   uint32_t can_retry_at_{0};

@@ -7,12 +7,14 @@ from esphome.const import CONF_ID
 
 CODEOWNERS = []
 DEPENDENCIES = ["uart"]
-AUTO_LOAD = ["sensor", "binary_sensor"]
+AUTO_LOAD = ["sensor", "binary_sensor", "canbus"]
 
 CONF_DIRECTION_PIN = "direction_pin"
 CONF_PACK_ADDRESSES = "pack_addresses"
 CONF_CANBUS_ID = "canbus_id"
 CONF_DEYE_CAN_BRIDGE = "deye_can_bridge"
+CONF_CAN_DIAGNOSTICS = "can_diagnostics"
+CONF_CAN_DIAGNOSTIC_SEND_TEST = "can_diagnostic_send_test"
 
 felicity_rs485_ns = cg.esphome_ns.namespace("felicity_rs485")
 FelicityRS485 = felicity_rs485_ns.class_(
@@ -37,6 +39,8 @@ CONFIG_SCHEMA = (
             cv.Required(CONF_PACK_ADDRESSES): _addresses,
             cv.Optional(CONF_CANBUS_ID): cv.use_id(canbus.CanbusComponent),
             cv.Optional(CONF_DEYE_CAN_BRIDGE, default=False): cv.boolean,
+            cv.Optional(CONF_CAN_DIAGNOSTICS, default=False): cv.boolean,
+            cv.Optional(CONF_CAN_DIAGNOSTIC_SEND_TEST, default=False): cv.boolean,
         }
     )
     .extend(cv.polling_component_schema("10s"))
@@ -54,6 +58,8 @@ async def to_code(config):
         canbus_var = await cg.get_variable(config[CONF_CANBUS_ID])
         cg.add(var.set_canbus(canbus_var))
     cg.add(var.set_bridge_enabled(config[CONF_DEYE_CAN_BRIDGE]))
+    cg.add(var.set_can_diagnostics_enabled(config[CONF_CAN_DIAGNOSTICS]))
+    cg.add(var.set_can_diagnostic_send_test(config[CONF_CAN_DIAGNOSTIC_SEND_TEST]))
     for address in config[CONF_PACK_ADDRESSES]:
         cg.add(var.add_pack(address))
 

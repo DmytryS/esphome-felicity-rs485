@@ -1,0 +1,72 @@
+esphome:
+  name: felicity-deye-usb-test
+  friendly_name: Felicity to Deye USB Test
+
+esp32:
+  board: esp32dev
+  flash_size: 8MB
+  framework:
+    type: arduino
+
+logger:
+  level: DEBUG
+
+external_components:
+  - source:
+      type: local
+      path: components
+    components: [felicity_rs485]
+
+uart:
+  id: felicity_uart
+  tx_pin: GPIO22
+  rx_pin: GPIO21
+  baud_rate: 9600
+  data_bits: 8
+  parity: NONE
+  stop_bits: 1
+  rx_buffer_size: 256
+
+canbus:
+  - platform: esp32_can
+    id: deye_can
+    tx_pin: GPIO27
+    rx_pin: GPIO26
+    can_id: 0x000
+    bit_rate: 500kbps
+    mode: NORMAL
+    on_frame:
+      - can_id: 0x000
+        can_id_mask: 0x000
+        then:
+          - lambda: |-
+              char data_hex[3 * 8 + 1] = {};
+              for (size_t i = 0; i < x.size() && i < 8; i++) {
+                snprintf(data_hex + (i * 3), sizeof(data_hex) - (i * 3), "%02X ", x[i]);
+              }
+              ESP_LOGI("deye_can_rx", "id=0x%03X dlc=%u rtr=%s data=%s",
+                       static_cast<unsigned>(can_id), static_cast<unsigned>(x.size()),
+                       remote_transmission_request ? "true" : "false", data_hex);
+
+felicity_rs485:
+  id: felicity_bus
+  uart_id: felicity_uart
+  direction_pin: GPIO17
+  pack_addresses: [1, 2]
+  update_interval: 10s
+  canbus_id: deye_can
+  deye_can_bridge: true
+  can_diagnostics: true
+  can_diagnostic_send_test: false
+
+sensor:
+  - platform: felicity_rs485
+    felicity_rs485_id: felicity_bus
+    address: 1
+    soc: {name: "Battery 1 SOC"}
+    soh: {name: "Battery 1 SOH"}
+  - platform: felicity_rs485
+    felicity_rs485_id: felicity_bus
+    address: 2
+    soc: {name: "Battery 2 SOC"}
+    soh: {name: "Battery 2 SOH"}

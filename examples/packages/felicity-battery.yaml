@@ -1,0 +1,88 @@
+# Include once per pack with a unique battery_address variable.
+# ESPHome packages merge the address, sensor, and binary_sensor lists.
+felicity_rs485:
+  pack_addresses: ["${battery_address}"]
+
+sensor:
+  - platform: felicity_rs485
+    felicity_rs485_id: felicity_bus
+    address: ${battery_address}
+    voltage: {name: "Battery ${battery_address} Voltage"}
+    current: {name: "Battery ${battery_address} Current"}
+    charge_current: {name: "Battery ${battery_address} Charge Current"}
+    discharge_current: {name: "Battery ${battery_address} Discharge Current"}
+    power: {name: "Battery ${battery_address} Power"}
+    soc: {name: "Battery ${battery_address} SOC"}
+    soh: {name: "Battery ${battery_address} SOH"}
+    full_capacity: {name: "Battery ${battery_address} Full Capacity"}
+    design_capacity: {name: "Battery ${battery_address} Design Capacity"}
+    remaining_capacity: {name: "Battery ${battery_address} Remaining Capacity"}
+    temperature: {name: "Battery ${battery_address} Temperature"}
+    cell_count: {name: "Battery ${battery_address} Cell Count"}
+    temperature_sensor_count: {name: "Battery ${battery_address} Temperature Sensor Count"}
+    min_cell_voltage: {name: "Battery ${battery_address} Minimum Cell Voltage"}
+    max_cell_voltage: {name: "Battery ${battery_address} Maximum Cell Voltage"}
+    average_cell_voltage: {name: "Battery ${battery_address} Average Cell Voltage"}
+    cell_delta: {name: "Battery ${battery_address} Cell Delta"}
+    min_voltage_cell: {name: "Battery ${battery_address} Minimum Voltage Cell"}
+    max_voltage_cell: {name: "Battery ${battery_address} Maximum Voltage Cell"}
+    charge_voltage_limit: {name: "Battery ${battery_address} Charge Voltage Limit"}
+    charge_current_limit: {name: "Battery ${battery_address} Charge Current Limit"}
+    discharge_voltage_limit: {name: "Battery ${battery_address} Discharge Voltage Limit"}
+    discharge_current_limit: {name: "Battery ${battery_address} Discharge Current Limit"}
+    # Runtime is exposed by the schema, but not decoded on the tested firmware.
+    runtime_to_empty: {name: "Battery ${battery_address} Runtime To Empty"}
+    packs_online: {name: "Battery ${battery_address} Packs Online Raw"}
+    # Felicity bitmasks, not a readback of the inverter's displayed codes.
+    charge_alarm: {name: "Battery ${battery_address} Charge Alarm Raw"}
+    discharge_alarm: {name: "Battery ${battery_address} Discharge Alarm Raw"}
+    charge_protect: {name: "Battery ${battery_address} Charge Protect Raw"}
+    charge_protect_2: {name: "Battery ${battery_address} Charge Protect 2 Raw"}
+    discharge_protect: {name: "Battery ${battery_address} Discharge Protect Raw"}
+    discharge_protect_2: {name: "Battery ${battery_address} Discharge Protect 2 Raw"}
+    status: {name: "Battery ${battery_address} Status Raw"}
+    protocol_type: {name: "Battery ${battery_address} Protocol Type"}
+    protocol_version: {name: "Battery ${battery_address} Protocol Version"}
+    firmware_version: {name: "Battery ${battery_address} Firmware Version"}
+    hardware_version: {name: "Battery ${battery_address} Hardware Version"}
+    bus_errors: {name: "Battery ${battery_address} Bus Errors"}
+    # The current RS485 poll reads 16 cell voltages (registers 17-32).
+    cell_voltage_1: {name: "Battery ${battery_address} Cell 01"}
+    cell_voltage_2: {name: "Battery ${battery_address} Cell 02"}
+    cell_voltage_3: {name: "Battery ${battery_address} Cell 03"}
+    cell_voltage_4: {name: "Battery ${battery_address} Cell 04"}
+    cell_voltage_5: {name: "Battery ${battery_address} Cell 05"}
+    cell_voltage_6: {name: "Battery ${battery_address} Cell 06"}
+    cell_voltage_7: {name: "Battery ${battery_address} Cell 07"}
+    cell_voltage_8: {name: "Battery ${battery_address} Cell 08"}
+    cell_voltage_9: {name: "Battery ${battery_address} Cell 09"}
+    cell_voltage_10: {name: "Battery ${battery_address} Cell 10"}
+    cell_voltage_11: {name: "Battery ${battery_address} Cell 11"}
+    cell_voltage_12: {name: "Battery ${battery_address} Cell 12"}
+    cell_voltage_13: {name: "Battery ${battery_address} Cell 13"}
+    cell_voltage_14: {name: "Battery ${battery_address} Cell 14"}
+    cell_voltage_15: {name: "Battery ${battery_address} Cell 15"}
+    cell_voltage_16: {name: "Battery ${battery_address} Cell 16"}
+    # All ten protocol slots; absent probes stay unknown. These are not
+    # necessarily individual cell temperatures. Check the reported count.
+    temperature_sensor_1: {name: "Battery ${battery_address} Temperature 1"}
+    temperature_sensor_2: {name: "Battery ${battery_address} Temperature 2"}
+    temperature_sensor_3: {name: "Battery ${battery_address} Temperature 3"}
+    temperature_sensor_4: {name: "Battery ${battery_address} Temperature 4"}
+    temperature_sensor_5: {name: "Battery ${battery_address} Temperature 5"}
+    temperature_sensor_6: {name: "Battery ${battery_address} Temperature 6"}
+    temperature_sensor_7: {name: "Battery ${battery_address} Temperature 7"}
+    temperature_sensor_8: {name: "Battery ${battery_address} Temperature 8"}
+    temperature_sensor_9: {name: "Battery ${battery_address} Temperature 9"}
+    temperature_sensor_10: {name: "Battery ${battery_address} Temperature 10"}
+
+binary_sensor:
+  - platform: felicity_rs485
+    felicity_rs485_id: felicity_bus
+    address: ${battery_address}
+    online: {name: "Battery ${battery_address} Online"}
+    charging: {name: "Battery ${battery_address} Charging"}
+    discharging: {name: "Battery ${battery_address} Discharging"}
+    fault: {name: "Battery ${battery_address} Fault"}
+    charge_enabled: {name: "Battery ${battery_address} Charge Enabled"}
+    discharge_enabled: {name: "Battery ${battery_address} Discharge Enabled"}

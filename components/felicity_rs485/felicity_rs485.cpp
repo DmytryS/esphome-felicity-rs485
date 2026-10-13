@@ -1,9 +1,11 @@
 #include "felicity_rs485.h"
+#include "deye_bank.h"
 
 #include "esphome/core/log.h"
 
 #include <algorithm>
 #include <cmath>
+#include <driver/twai.h>
 
 namespace esphome {
 namespace felicity_rs485 {
@@ -28,9 +30,22 @@ static const FelicityRS485::Block BLOCKS[] = {
     {"runtime-probe", 117, 1},
     {"remaining-high-probe", 118, 1},
     {"remaining-low-probe", 119, 1},
+    // Native Felicity low-voltage BMS map: SOC 0x0210, SOH 0x0211,
+    // pack capacity high/low words 0x0212-0x0213 (read only).
+    {"native-telemetry", 0x0210, 4},
 };
 
 static bool time_reached(uint32_t target) { return static_cast<int32_t>(millis() - target) >= 0; }
+
+static const char *twai_state_name(twai_state_t state) {
+  switch (state) {
+    case TWAI_STATE_STOPPED: return "STOPPED";
+    case TWAI_STATE_RUNNING: return "RUNNING";
+    case TWAI_STATE_BUS_OFF: return "BUS_OFF";
+    case TWAI_STATE_RECOVERING: return "RECOVERING";
+    default: return "UNKNOWN";
+  }
+}
 
 static void publish(sensor::Sensor *sensor, float value, float min_change = 0.0001f) {
   if (sensor == nullptr)
@@ -83,6 +98,14 @@ void FelicityRS485::setup() {
   this->rx_buffer_.reserve(64);
   for (auto &pack : this->packs_)
     publish(pack.online_binary_sensor, false);
+  if (this->can_diagnostics_enabled_) {
+    // This project configures one ESP32 TWAI controller, which ESPHome assigns
+    // controller 0; use the matching handle-less ESP-IDF diagnostics API.
+    esp_err_t err = twai_reconfigure_alerts(TWAI_ALERT_ALL, nullptr);
+    ESP_LOGI(TAG, "TWAI diagnostics enabled: alerts=%s", esp_err_to_name(err));
+    this->can_diagnostic_started_at_ = millis();
+    this->can_diagnostic_next_status_at_ = millis() + 1000;
+  }
   this->set_timeout(1000, [this]() { this->update(); });
 }
 
@@ -114,6 +137,45 @@ void FelicityRS485::update() {
 
 void FelicityRS485::loop() {
   this->transmit_deye_frames_();
+
+  if (this->can_diagnostics_enabled_) {
+    uint32_t alerts = 0;
+    if (twai_read_alerts(&alerts, 0) == ESP_OK && alerts != 0) {
+      ESP_LOGI(TAG,
+               "TWAI alerts=0x%05X TX_SUCCESS=%u BUS_ERROR=%u ERR_WARN=%u ERR_PASS=%u BUS_OFF=%u RX_DATA=%u",
+               static_cast<unsigned>(alerts), !!(alerts & TWAI_ALERT_TX_SUCCESS),
+               !!(alerts & TWAI_ALERT_BUS_ERROR), !!(alerts & TWAI_ALERT_ABOVE_ERR_WARN),
+               !!(alerts & TWAI_ALERT_ERR_PASS), !!(alerts & TWAI_ALERT_BUS_OFF),
+               !!(alerts & TWAI_ALERT_RX_DATA));
+    }
+
+    if (this->can_diagnostic_send_test_ && !this->can_diagnostic_test_sent_ &&
+        millis() - this->can_diagnostic_started_at_ >= 1500) {
+      std::vector<uint8_t> payload(8, 0);
+      auto result = this->canbus_ == nullptr
+                        ? canbus::ERROR_FAIL
+                        : this->canbus_->send_data(0x7FF, false, false, payload);
+      ESP_LOGI(TAG, "One-shot harmless CAN test frame ID=0x7FF result=%u (0 means accepted by TX queue)",
+               static_cast<unsigned>(result));
+      this->can_diagnostic_test_sent_ = true;
+    }
+
+    if (time_reached(this->can_diagnostic_next_status_at_)) {
+      twai_status_info_t status{};
+      esp_err_t err = twai_get_status_info(&status);
+      if (err == ESP_OK) {
+        ESP_LOGI(TAG, "TWAI status=%s pending_tx=%u pending_rx=%u TEC=%u REC=%u bus_errors=%u arb_lost=%u",
+                 twai_state_name(status.state), static_cast<unsigned>(status.msgs_to_tx),
+                 static_cast<unsigned>(status.msgs_to_rx), static_cast<unsigned>(status.tx_error_counter),
+                 static_cast<unsigned>(status.rx_error_counter), static_cast<unsigned>(status.bus_error_count),
+                 static_cast<unsigned>(status.arb_lost_count));
+      } else {
+        ESP_LOGW(TAG, "TWAI status query failed: %s", esp_err_to_name(err));
+      }
+      this->can_diagnostic_next_status_at_ = millis() + 2000;
+    }
+  }
+
   if (!this->busy_)
     return;
 
@@ -147,6 +209,15 @@ void FelicityRS485::loop() {
 }
 
 void FelicityRS485::start_next_request_() {
+  const size_t block_count = sizeof(BLOCKS) / sizeof(BLOCKS[0]);
+  while (this->pack_index_ < this->packs_.size()) {
+    if (this->block_index_ >= block_count) {
+      this->block_index_ = 0;
+      this->pack_index_++;
+      continue;
+    }
+    break;
+  }
   if (this->pack_index_ >= this->packs_.size()) {
     this->busy_ = false;
     ESP_LOGD(TAG, "Poll cycle complete");
@@ -269,7 +340,7 @@ bool FelicityRS485::parse_response_(FelicityPack &pack, const Block &block) {
 }
 
 void FelicityRS485::transmit_deye_frames_() {
-  if (!this->bridge_enabled_ || this->canbus_ == nullptr || this->packs_.size() != 2)
+  if (!this->bridge_enabled_ || this->canbus_ == nullptr || this->packs_.empty())
     return;
   const uint32_t now = millis();
   if (!time_reached(this->can_retry_at_))
@@ -279,93 +350,70 @@ void FelicityRS485::transmit_deye_frames_() {
   if (this->can_frame_index_ != 0 && now - this->last_can_tx_at_ < CAN_FRAME_GAP_MS)
     return;
 
-  // Require recent telemetry, limits, and alarm words from both packs. Never
-  // keep presenting old BMS limits to the inverter after RS485 comms fail.
-  float total_capacity = 0.0f;
-  float weighted_soc = 0.0f;
-  float total_current = 0.0f;
-  float charge_current_limit = 0.0f;
-  float discharge_current_limit = 0.0f;
-  float charge_voltage_limit = 1000.0f;
-  float discharge_voltage_limit = 1000.0f;
-  float total_voltage = 0.0f;
-  float total_temperature = 0.0f;
-  uint8_t temperature_count = 0;
-  bool any_bms_fault = false;
-  for (const auto &pack : this->packs_) {
-    if (!pack.telemetry_valid || !pack.alarms_valid || !pack.limits_valid ||
-        pack.consecutive_status_failures >= 3 ||
-        now - pack.telemetry_updated_at > BRIDGE_DATA_MAX_AGE_MS ||
-        now - pack.alarms_updated_at > BRIDGE_DATA_MAX_AGE_MS ||
-        now - pack.limits_updated_at > BRIDGE_DATA_MAX_AGE_MS) {
-      return;
-    }
-    const float capacity = pack.full_capacity_raw * 0.001f;
-    if (capacity <= 0.0f || pack.soc_raw > 100)
-      return;
-    const float voltage_scale = pack.voltage_raw >= 10000 ? 0.001f : 0.1f;
-    const float voltage = pack.voltage_raw * voltage_scale;
-    if (voltage < 40.0f || voltage > 65.0f)
-      return;
-    total_capacity += capacity;
-    total_voltage += voltage;
-    weighted_soc += capacity * pack.soc_raw;
-    total_current += (pack.charge_current_raw - std::abs(static_cast<int16_t>(pack.discharge_current_raw))) * 0.1f;
-    charge_current_limit += pack.charge_current_limit_raw * 0.1f;
-    discharge_current_limit += pack.discharge_current_limit_raw * 0.1f;
-    charge_voltage_limit = std::min(charge_voltage_limit, pack.charge_voltage_limit_raw * 0.1f);
-    discharge_voltage_limit = std::min(discharge_voltage_limit, pack.discharge_voltage_limit_raw * 0.1f);
-    for (uint8_t i = 0; i < std::min<uint16_t>(pack.temperature_count, FELICITY_MAX_TEMPERATURES); i++) {
-      float temperature = temperature_c(pack.temperatures_raw[i]);
-      if (!std::isnan(temperature) && temperature >= -30.0f && temperature <= 100.0f) {
-        total_temperature += temperature;
-        temperature_count++;
-      }
-    }
-    any_bms_fault |= pack.charge_alarm_raw || pack.discharge_alarm_raw || pack.charge_protect_raw ||
-                     pack.charge_protect_2_raw || pack.discharge_protect_raw || pack.discharge_protect_2_raw;
-  }
-  if (total_capacity <= 0.0f || temperature_count == 0 || charge_voltage_limit <= 0.0f ||
-      discharge_voltage_limit <= 0.0f)
+  // Every configured pack must be fresh; do not silently drop a missing pack.
+  DeyeBankData bank;
+  if (!aggregate_deye_bank(this->packs_, now, BRIDGE_DATA_MAX_AGE_MS,
+                           FELICITY_MAX_TEMPERATURES, temperature_c, bank))
     return;
 
-  auto write_u16 = [](std::vector<uint8_t> &data, size_t offset, int32_t value) {
-    uint16_t v = static_cast<uint16_t>(std::max<int32_t>(0, std::min<int32_t>(65535, value)));
+  auto write_u16 = [](std::vector<uint8_t> &data, size_t offset, double value) {
+    uint16_t v = deye_unsigned_word(value);
     data[offset] = v & 0xFF;
     data[offset + 1] = v >> 8;
   };
   std::vector<uint8_t> limits(8, 0);
-  write_u16(limits, 0, std::lround(charge_voltage_limit * 10));
-  write_u16(limits, 2, std::lround(charge_current_limit * 10));
-  write_u16(limits, 4, std::lround(discharge_current_limit * 10));
-  write_u16(limits, 6, std::lround(discharge_voltage_limit * 10));
+  write_u16(limits, 0, std::lround(bank.charge_voltage_limit * 10));
+  write_u16(limits, 2, deye_current_limit_word(bank.charge_current_limit * 10));
+  write_u16(limits, 4, deye_current_limit_word(bank.discharge_current_limit * 10));
+  write_u16(limits, 6, std::lround(bank.discharge_voltage_limit * 10));
   std::vector<uint8_t> soc_soh(8, 0);
-  write_u16(soc_soh, 0, std::lround(weighted_soc / total_capacity));
-  // Felicity returned zero design-capacity registers, so SOH is unknown.
-  // Keep the protocol field explicitly zero rather than making up a value.
-  write_u16(soc_soh, 2, 0);
+  write_u16(soc_soh, 0, std::lround(bank.weighted_soc / bank.total_capacity));
+  // Native capacity-weighted SOH across every configured battery.
+  write_u16(soc_soh, 2, bank.weighted_soh / bank.native_capacity_ah);
   std::vector<uint8_t> telemetry(8, 0);
   // Deye's 0x356 voltage field is in 0.01 V units.
-  write_u16(telemetry, 0, std::lround((total_voltage / this->packs_.size()) * 100.0f));
-  int32_t current_deciamps = std::lround(total_current * 10);
+  write_u16(telemetry, 0, std::lround((bank.total_voltage / this->packs_.size()) * 100.0f));
+  int32_t current_deciamps = std::lround(bank.total_current * 10);
   uint16_t current_word = static_cast<uint16_t>(static_cast<int16_t>(std::max<int32_t>(-32768, std::min<int32_t>(32767, current_deciamps))));
   telemetry[2] = current_word & 0xFF;
   telemetry[3] = current_word >> 8;
-  int16_t temp_degrees = static_cast<int16_t>(std::lround((total_temperature / temperature_count) * 10));
+  int16_t temp_degrees = static_cast<int16_t>(std::lround((bank.total_temperature / bank.temperature_count) * 10));
   telemetry[4] = static_cast<uint8_t>(temp_degrees & 0xFF);
   telemetry[5] = static_cast<uint8_t>((static_cast<uint16_t>(temp_degrees) >> 8) & 0xFF);
-  // We do not yet have a verified bit-by-bit Felicity-to-Deye alarm mapping.
-  // Assert only the generic system-error bit when any raw BMS alarm/protection is active.
+  // Deye PCS V3.3 0x359 uses bytes 0-6 for protection/alarm/system-error
+  // tables and reserves byte 7. With the DY001 identity, do NOT put the
+  // generic Pylon module count or 'P'/'N' markers in bytes 4-6: those are
+  // interpreted as real faults. Module counts belong in PCS frame 0x364.
+  // TODO: The existing nonzero-fault fallback below comes from the generic
+  // protocol; a bit-by-bit Felicity-to-PCS fault mapping is still unverified.
+  // This correction only removes the bogus metadata-derived fault bits.
   std::vector<uint8_t> alarms(8, 0);
-  alarms[1] = any_bms_fault ? 0x01 : 0x00;
-  alarms[4] = 'N';
-  alarms[5] = 'P';
-  alarms[6] = static_cast<uint8_t>(this->packs_.size());
-  std::vector<uint8_t> brand{'F', 'e', 'l', 'i', 'c', 'i', 't', 'y'};
-  static constexpr uint32_t CAN_IDS[] = {0x351, 0x355, 0x356, 0x359, 0x35E};
-  const std::vector<uint8_t> *frames[] = {&limits, &soc_soh, &telemetry, &alarms, &brand};
-  auto result = this->canbus_->send_data(CAN_IDS[this->can_frame_index_], false, false,
-                                         *frames[this->can_frame_index_]);
+  alarms[1] = bank.any_bms_fault ? 0x08 : 0x00;
+  // 0x35C request/enable flags: preserve the BMS charge/discharge permissions
+  // and leave force-charge/full-charge requests clear until Felicity's
+  // semantics for those request bits are confirmed.
+  std::vector<uint8_t> requests(8, 0);
+  requests[0] = bank.can_enable_flags;
+  // Deye PCS profile 0x35E: "DY001", manufacturer code, and aggregate
+  // nominal capacity in 0.1 Ah. Use code 3 (EVE 100 Ah) as the closest
+  // 100 Ah Deye profile; the Felicity cell maker has not been independently
+  // verified. Nominal capacity is the sum of the native capacities of all packs.
+  std::vector<uint8_t> brand{'D', 'Y', '0', '0', '1', 0x03, 0, 0};
+  write_u16(brand, 6, bank.native_capacity_ah * 10);
+  // Synthetic bridge version, not the Felicity BMS firmware version.
+  // This Deye HMI displayed bytes EA 07 as EA07, so send 00 01 to target
+  // the visible label 0001. Leave the hardware-version bytes at zero.
+  std::vector<uint8_t> bms_version{0x00, 0x01, 0x00, 0x00, 0, 0, 0, 0};
+  // Current tested subset of the Deye PCS profile, including the synthetic
+  // version frame. Extra PCS telemetry frames are not implemented here yet.
+  static constexpr uint32_t CAN_IDS[] = {0x351, 0x355, 0x356, 0x359, 0x35C, 0x35E, 0x363};
+  const std::vector<uint8_t> *frames[] = {&limits, &soc_soh, &telemetry, &alarms, &requests, &brand, &bms_version};
+  const auto &frame = *frames[this->can_frame_index_];
+  char frame_hex[3 * 8 + 1] = {};
+  for (size_t i = 0; i < frame.size() && i < 8; i++)
+    snprintf(frame_hex + i * 3, sizeof(frame_hex) - i * 3, "%02X ", frame[i]);
+  ESP_LOGI(TAG, "Deye CAN TX id=0x%03X data=%s", static_cast<unsigned>(CAN_IDS[this->can_frame_index_]), frame_hex);
+  auto result = this->canbus_->send_data(CAN_IDS[this->can_frame_index_], false, false, frame);
   if (result != canbus::ERROR_OK) {
     ESP_LOGW(TAG, "Deye CAN TX 0x%03X failed (%d); retrying after 1s",
              static_cast<unsigned>(CAN_IDS[this->can_frame_index_]), static_cast<int>(result));
@@ -376,7 +424,7 @@ void FelicityRS485::transmit_deye_frames_() {
   this->last_can_tx_at_ = now;
   if (this->can_frame_index_ == 0)
     this->last_can_cycle_at_ = now;
-  this->can_frame_index_ = (this->can_frame_index_ + 1) % 5;
+  this->can_frame_index_ = (this->can_frame_index_ + 1) % 7;
 }
 
 void FelicityRS485::finish_request_(bool success) {
@@ -415,8 +463,10 @@ void FelicityRS485::apply_registers_(FelicityPack &pack, uint16_t start,
     pack.hardware_version = (static_cast<uint32_t>(value(5)) << 16) | value(6);
   } else if (start == 16) {
     pack.cell_count = value(16);
+    // The current poll returns 16 cells, while storage reserves 20 slots.
+    // Never index past the response or retain values for unreturned cells.
     for (uint8_t i = 0; i < FELICITY_MAX_CELLS; i++)
-      pack.cells_raw[i] = value(17 + i);
+      pack.cells_raw[i] = static_cast<size_t>(i + 1) < registers.size() ? value(17 + i) : 0;
   } else if (start == 37) {
     pack.temperature_count = value(37);
     for (uint8_t i = 0; i < FELICITY_MAX_TEMPERATURES; i++)
@@ -444,10 +494,21 @@ void FelicityRS485::apply_registers_(FelicityPack &pack, uint16_t start,
   } else if (start == 117) {
     pack.runtime_to_empty_raw = value(117);
     pack.remaining_capacity_raw = (static_cast<uint32_t>(value(118)) << 16) | value(119);
+  } else if (start == 0x0210) {
+    pack.native_soc_tenths = value(0x0210);
+    pack.native_soh_tenths = value(0x0211);
+    pack.native_capacity_mah = (static_cast<uint32_t>(value(0x0212)) << 16) | value(0x0213);
+    pack.native_status_updated_at = millis();
+    pack.native_status_valid = pack.native_soh_tenths <= 1000 && pack.native_capacity_mah > 0;
   }
 }
 
 void FelicityRS485::publish_block_(FelicityPack &pack, uint16_t start) {
+  if (start == 0x0210) {
+    if (pack.native_status_valid)
+      publish(pack.soh_sensor, pack.native_soh_tenths / 10.0f);
+    return;
+  }
   if (start == 1) {
     publish(pack.protocol_type_sensor, pack.protocol_type);
     publish(pack.protocol_version_sensor, pack.protocol_version);
@@ -554,7 +615,7 @@ void FelicityRS485::publish_block_(FelicityPack &pack, uint16_t start) {
     if (pack.design_capacity_raw > 0) {
       float design_capacity = pack.design_capacity_raw * 0.001f;
       publish(pack.design_capacity_sensor, design_capacity);
-      if (pack.full_capacity_raw > 0)
+      if (pack.full_capacity_raw > 0 && !pack.native_status_valid)
         publish(pack.soh_sensor, pack.full_capacity_raw * 100.0f / pack.design_capacity_raw);
     }
     return;
