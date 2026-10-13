@@ -1,0 +1,468 @@
+#include "felicity_rs485.h"
+
+#include "esphome/core/log.h"
+
+#include <algorithm>
+#include <cmath>
+
+namespace esphome {
+namespace felicity_rs485 {
+
+static const char *const TAG = "felicity_rs485";
+static constexpr uint32_t RESPONSE_TIMEOUT_MS = 500;
+static constexpr uint32_t FRAME_SILENCE_MS = 20;
+static constexpr uint32_t INTER_FRAME_GAP_MS = 120;
+
+static const FelicityRS485::Block BLOCKS[] = {
+    {"identity", 1, 6},
+    {"cells", 16, 17},
+    {"telemetry", 37, 17},
+    {"alarms", 54, 10},
+    {"cell-state", 64, 11},
+    {"temperature-state", 80, 6},
+    {"module-state", 96, 10},
+    {"limits", 112, 5},
+    {"runtime-probe", 117, 1},
+    {"remaining-high-probe", 118, 1},
+    {"remaining-low-probe", 119, 1},
+};
+
+static bool time_reached(uint32_t target) { return static_cast<int32_t>(millis() - target) >= 0; }
+
+static void publish(sensor::Sensor *sensor, float value, float min_change = 0.0001f) {
+  if (sensor == nullptr)
+    return;
+  if (!sensor->has_state() || std::isnan(sensor->state) || std::fabs(sensor->state - value) >= min_change)
+    sensor->publish_state(value);
+}
+
+static void publish(binary_sensor::BinarySensor *sensor, bool value) {
+  if (sensor != nullptr && (!sensor->has_state() || sensor->state != value))
+    sensor->publish_state(value);
+}
+
+static float temperature_c(uint16_t raw) {
+  if (raw == 0)
+    return NAN;
+  if (raw > 1000)
+    return raw / 10.0f - 273.15f;
+  return raw - 273.15f;
+}
+
+static float version_number(uint32_t raw) {
+  uint16_t major = raw >> 16;
+  uint16_t minor = raw & 0xFFFF;
+  return major + minor / (minor < 10 ? 10.0f : 100.0f);
+}
+
+void FelicityRS485::add_pack(uint8_t address) {
+  FelicityPack pack;
+  pack.address = address;
+  this->packs_.push_back(pack);
+}
+
+FelicityPack *FelicityRS485::find_pack_(uint8_t address) {
+  for (auto &pack : this->packs_) {
+    if (pack.address == address)
+      return &pack;
+  }
+  return nullptr;
+}
+
+void FelicityRS485::setup() {
+  if (this->direction_pin_ == nullptr) {
+    ESP_LOGE(TAG, "RS485 direction pin is not configured");
+    this->mark_failed();
+    return;
+  }
+  this->direction_pin_->setup();
+  this->direction_pin_->digital_write(false);
+  this->rx_buffer_.reserve(64);
+  for (auto &pack : this->packs_)
+    publish(pack.online_binary_sensor, false);
+  this->set_timeout(1000, [this]() { this->update(); });
+}
+
+void FelicityRS485::dump_config() {
+  ESP_LOGCONFIG(TAG, "Felicity Solar RS485:");
+  LOG_PIN("  Direction pin: ", this->direction_pin_);
+  ESP_LOGCONFIG(TAG, "  Packs: %u", static_cast<unsigned>(this->packs_.size()));
+  for (const auto &pack : this->packs_)
+    ESP_LOGCONFIG(TAG, "    Address %u", pack.address);
+  ESP_LOGCONFIG(TAG, "  Poll interval: %u ms", static_cast<unsigned>(this->get_update_interval()));
+  this->check_uart_settings(9600, 1, uart::UART_CONFIG_PARITY_NONE, 8);
+}
+
+void FelicityRS485::update() {
+  if (this->busy_) {
+    ESP_LOGW(TAG, "Previous poll cycle is still active; skipping this interval");
+    return;
+  }
+  if (this->packs_.empty()) {
+    ESP_LOGW(TAG, "No pack addresses configured");
+    return;
+  }
+  this->pack_index_ = 0;
+  this->block_index_ = 0;
+  this->busy_ = true;
+  this->waiting_ = false;
+  this->next_request_at_ = millis();
+}
+
+void FelicityRS485::loop() {
+  if (!this->busy_)
+    return;
+
+  if (!this->waiting_) {
+    if (time_reached(this->next_request_at_))
+      this->start_next_request_();
+    return;
+  }
+
+  bool received = false;
+  while (this->available()) {
+    uint8_t value;
+    if (!this->read_byte(&value))
+      break;
+    received = true;
+    if (this->rx_buffer_.size() < 128)
+      this->rx_buffer_.push_back(value);
+  }
+  if (received)
+    this->last_byte_at_ = millis();
+
+  auto &pack = this->packs_[this->pack_index_];
+  const auto &block = BLOCKS[this->block_index_];
+  if (!this->rx_buffer_.empty() && millis() - this->last_byte_at_ >= FRAME_SILENCE_MS) {
+    this->finish_request_(this->parse_response_(pack, block));
+  } else if (millis() - this->request_started_at_ >= RESPONSE_TIMEOUT_MS) {
+    ESP_LOGW(TAG, "Address %u %s: response timeout (%u bytes)", pack.address, block.name,
+             static_cast<unsigned>(this->rx_buffer_.size()));
+    this->finish_request_(false);
+  }
+}
+
+void FelicityRS485::start_next_request_() {
+  if (this->pack_index_ >= this->packs_.size()) {
+    this->busy_ = false;
+    ESP_LOGD(TAG, "Poll cycle complete");
+    return;
+  }
+  this->send_request_(this->packs_[this->pack_index_], BLOCKS[this->block_index_]);
+}
+
+void FelicityRS485::send_request_(FelicityPack &pack, const Block &block) {
+  while (this->available()) {
+    uint8_t discard;
+    this->read_byte(&discard);
+  }
+  this->rx_buffer_.clear();
+
+  uint8_t request[8] = {
+      pack.address,
+      0x03,
+      static_cast<uint8_t>(block.start >> 8),
+      static_cast<uint8_t>(block.start & 0xFF),
+      static_cast<uint8_t>(block.count >> 8),
+      static_cast<uint8_t>(block.count & 0xFF),
+      0,
+      0,
+  };
+  uint16_t crc = crc16_(request, 6);
+  request[6] = crc & 0xFF;
+  request[7] = crc >> 8;
+
+  ESP_LOGD(TAG, "TX address %u %s: start=%u count=%u", pack.address, block.name, block.start, block.count);
+  this->direction_pin_->digital_write(true);
+  delayMicroseconds(200);
+  this->write_array(request, sizeof(request));
+  this->flush();
+  delayMicroseconds(200);
+  this->direction_pin_->digital_write(false);
+
+  this->request_started_at_ = millis();
+  this->last_byte_at_ = this->request_started_at_;
+  this->waiting_ = true;
+}
+
+bool FelicityRS485::parse_response_(FelicityPack &pack, const Block &block) {
+  const auto &frame = this->rx_buffer_;
+  if (frame.size() < 5) {
+    ESP_LOGW(TAG, "Address %u %s: short response (%u bytes)", pack.address, block.name,
+             static_cast<unsigned>(frame.size()));
+    return false;
+  }
+  uint16_t received_crc = frame[frame.size() - 2] | (static_cast<uint16_t>(frame.back()) << 8);
+  uint16_t calculated_crc = crc16_(frame.data(), frame.size() - 2);
+  if (received_crc != calculated_crc) {
+    ESP_LOGW(TAG, "Address %u %s: CRC mismatch (got 0x%04X expected 0x%04X)", pack.address, block.name,
+             received_crc, calculated_crc);
+    ESP_LOGW(TAG, "RX raw (%u bytes): %s", static_cast<unsigned>(frame.size()),
+             format_hex_pretty(frame).c_str());
+    return false;
+  }
+  if (frame[0] != pack.address) {
+    ESP_LOGW(TAG, "Address %u %s: response belongs to address %u", pack.address, block.name, frame[0]);
+    return false;
+  }
+  if (frame[1] & 0x80) {
+    ESP_LOGW(TAG, "Address %u %s: exception code %u", pack.address, block.name, frame[2]);
+    return false;
+  }
+  if (frame[1] != 0x03) {
+    ESP_LOGW(TAG, "Address %u %s: unexpected function 0x%02X", pack.address, block.name, frame[1]);
+    return false;
+  }
+
+  size_t data_offset = 0;
+  size_t data_length = 0;
+  size_t body_length = frame.size() - 4;  // after address/function and before CRC
+  uint8_t count8 = frame[2];
+  if ((count8 == body_length - 1 || count8 == body_length + 1) && ((body_length - 1) % 2 == 0)) {
+    data_offset = 3;
+    data_length = body_length - 1;
+  } else if (frame.size() >= 6) {
+    uint16_t count16 = (static_cast<uint16_t>(frame[2]) << 8) | frame[3];
+    if (count16 * 2 == frame.size() - 6) {
+      data_offset = 4;
+      data_length = count16 * 2;
+    }
+  }
+  if (data_offset == 0 || data_length / 2 != block.count) {
+    ESP_LOGW(TAG, "Address %u %s: invalid payload/header (%u bytes)", pack.address, block.name,
+             static_cast<unsigned>(frame.size()));
+    ESP_LOGVV(TAG, "RX: %s", format_hex_pretty(frame).c_str());
+    return false;
+  }
+
+  std::vector<uint16_t> registers;
+  registers.reserve(block.count);
+  for (size_t offset = 0; offset < data_length; offset += 2) {
+    size_t index = data_offset + offset;
+    registers.push_back((static_cast<uint16_t>(frame[index]) << 8) | frame[index + 1]);
+  }
+  ESP_LOGD(TAG, "RX address %u %s: %u registers", pack.address, block.name,
+           static_cast<unsigned>(registers.size()));
+  for (size_t index = 0; index < registers.size(); index++) {
+    ESP_LOGD(TAG, "RX address %u register[%u]=%u (0x%04X)", pack.address,
+             static_cast<unsigned>(block.start + index), registers[index], registers[index]);
+  }
+  if (block.start >= 117 && block.start <= 119)
+    return true;  // Probe individually; these registers are undocumented on this battery firmware.
+  this->apply_registers_(pack, block.start, registers);
+  this->publish_block_(pack, block.start);
+  return true;
+}
+
+void FelicityRS485::finish_request_(bool success) {
+  auto &pack = this->packs_[this->pack_index_];
+  const auto &block = BLOCKS[this->block_index_];
+  if (!success) {
+    pack.bus_errors++;
+    publish(pack.bus_errors_sensor, pack.bus_errors);
+    if (block.start == 37) {
+      pack.consecutive_status_failures++;
+      if (pack.consecutive_status_failures >= 3)
+        publish(pack.online_binary_sensor, false);
+    }
+  } else if (block.start == 37) {
+    pack.consecutive_status_failures = 0;
+    publish(pack.online_binary_sensor, true);
+  }
+
+  this->waiting_ = false;
+  this->rx_buffer_.clear();
+  this->block_index_++;
+  if (this->block_index_ >= sizeof(BLOCKS) / sizeof(BLOCKS[0])) {
+    this->block_index_ = 0;
+    this->pack_index_++;
+  }
+  this->next_request_at_ = millis() + INTER_FRAME_GAP_MS;
+}
+
+void FelicityRS485::apply_registers_(FelicityPack &pack, uint16_t start,
+                                      const std::vector<uint16_t> &registers) {
+  auto value = [&](uint16_t address) -> uint16_t { return registers[address - start]; };
+  if (start == 1) {
+    pack.protocol_type = value(1);
+    pack.protocol_version = value(2);
+    pack.firmware_version = (static_cast<uint32_t>(value(3)) << 16) | value(4);
+    pack.hardware_version = (static_cast<uint32_t>(value(5)) << 16) | value(6);
+  } else if (start == 16) {
+    pack.cell_count = value(16);
+    for (uint8_t i = 0; i < FELICITY_MAX_CELLS; i++)
+      pack.cells_raw[i] = value(17 + i);
+  } else if (start == 37) {
+    pack.temperature_count = value(37);
+    for (uint8_t i = 0; i < FELICITY_MAX_TEMPERATURES; i++)
+      pack.temperatures_raw[i] = value(38 + i);
+    pack.charge_current_raw = value(48);
+    pack.discharge_current_raw = static_cast<int16_t>(value(49));
+    pack.voltage_raw = value(50);
+    pack.soc_raw = value(51);
+    pack.full_capacity_raw = (static_cast<uint32_t>(value(52)) << 16) | value(53);
+  } else if (start == 54) {
+    pack.packs_online_raw = value(54);
+    pack.charge_alarm_raw = value(55);
+    pack.discharge_alarm_raw = value(56);
+    pack.charge_protect_raw = value(57);
+    pack.charge_protect_2_raw = value(58);
+    pack.discharge_protect_raw = value(59);
+    pack.discharge_protect_2_raw = value(60);
+    pack.design_capacity_raw = (static_cast<uint32_t>(value(62)) << 16) | value(63);
+  } else if (start == 112) {
+    pack.charge_voltage_limit_raw = value(112);
+    pack.discharge_voltage_limit_raw = value(113);
+    pack.charge_current_limit_raw = value(114);
+    pack.discharge_current_limit_raw = value(115);
+    pack.status_raw = value(116);
+  } else if (start == 117) {
+    pack.runtime_to_empty_raw = value(117);
+    pack.remaining_capacity_raw = (static_cast<uint32_t>(value(118)) << 16) | value(119);
+  }
+}
+
+void FelicityRS485::publish_block_(FelicityPack &pack, uint16_t start) {
+  if (start == 1) {
+    publish(pack.protocol_type_sensor, pack.protocol_type);
+    publish(pack.protocol_version_sensor, pack.protocol_version);
+    publish(pack.firmware_version_sensor, version_number(pack.firmware_version));
+    publish(pack.hardware_version_sensor, version_number(pack.hardware_version));
+    return;
+  }
+
+  if (start == 16) {
+    publish(pack.cell_count_sensor, pack.cell_count);
+    uint8_t count = std::min<uint16_t>(pack.cell_count, FELICITY_MAX_CELLS);
+    float scale = (count > 0 && pack.cells_raw[0] > 1000) ? 0.001f : 0.1f;
+    float minimum = 1000.0f;
+    float maximum = 0.0f;
+    float total = 0.0f;
+    uint8_t valid = 0;
+    uint8_t min_index = 0;
+    uint8_t max_index = 0;
+    for (uint8_t i = 0; i < count; i++) {
+      if (pack.cells_raw[i] == 0)
+        continue;
+      float voltage = pack.cells_raw[i] * scale;
+      publish(pack.cell_voltage_sensors[i], voltage, 0.0005f);
+      total += voltage;
+      valid++;
+      if (voltage < minimum) {
+        minimum = voltage;
+        min_index = i + 1;
+      }
+      if (voltage > maximum) {
+        maximum = voltage;
+        max_index = i + 1;
+      }
+    }
+    if (valid > 0) {
+      publish(pack.min_cell_voltage_sensor, minimum, 0.0005f);
+      publish(pack.max_cell_voltage_sensor, maximum, 0.0005f);
+      publish(pack.average_cell_voltage_sensor, total / valid, 0.0005f);
+      publish(pack.cell_delta_sensor, (maximum - minimum) * 1000.0f, 0.5f);
+      publish(pack.min_voltage_cell_sensor, min_index);
+      publish(pack.max_voltage_cell_sensor, max_index);
+    }
+    return;
+  }
+
+  if (start == 37) {
+    float voltage_scale = pack.voltage_raw >= 10000 ? 0.001f : 0.1f;
+    float voltage = pack.voltage_raw * voltage_scale;
+    float charge_current = pack.charge_current_raw * 0.1f;
+    float discharge_current = std::abs(static_cast<float>(pack.discharge_current_raw)) * 0.1f;
+    float current = charge_current - discharge_current;
+    float full_capacity = pack.full_capacity_raw * 0.001f;
+    publish(pack.voltage_sensor, voltage);
+    publish(pack.charge_current_sensor, charge_current);
+    publish(pack.discharge_current_sensor, discharge_current);
+    publish(pack.current_sensor, current);
+    publish(pack.power_sensor, voltage * current, 0.5f);
+    publish(pack.soc_sensor, pack.soc_raw);
+    publish(pack.full_capacity_sensor, full_capacity);
+    if (pack.remaining_capacity_raw == 0)
+      publish(pack.remaining_capacity_sensor, full_capacity * pack.soc_raw / 100.0f);
+    publish(pack.temperature_count_sensor, pack.temperature_count);
+
+    uint8_t count = std::min<uint16_t>(pack.temperature_count, FELICITY_MAX_TEMPERATURES);
+    float total = 0.0f;
+    uint8_t valid = 0;
+    for (uint8_t i = 0; i < count; i++) {
+      float temperature = temperature_c(pack.temperatures_raw[i]);
+      if (std::isnan(temperature))
+        continue;
+      publish(pack.temperature_sensors[i], temperature, 0.05f);
+      if (i < 3) {
+        total += temperature;
+        valid++;
+      }
+    }
+    if (valid == 0) {
+      for (uint8_t i = 3; i < count; i++) {
+        float temperature = temperature_c(pack.temperatures_raw[i]);
+        if (!std::isnan(temperature)) {
+          total += temperature;
+          valid++;
+        }
+      }
+    }
+    if (valid > 0)
+      publish(pack.pack_temperature_sensor, total / valid, 0.05f);
+    publish(pack.charging_binary_sensor, charge_current > 0.0f);
+    publish(pack.discharging_binary_sensor, discharge_current > 0.0f);
+    return;
+  }
+
+  if (start == 54) {
+    publish(pack.packs_online_sensor, pack.packs_online_raw);
+    publish(pack.charge_alarm_sensor, pack.charge_alarm_raw);
+    publish(pack.discharge_alarm_sensor, pack.discharge_alarm_raw);
+    publish(pack.charge_protect_sensor, pack.charge_protect_raw);
+    publish(pack.charge_protect_2_sensor, pack.charge_protect_2_raw);
+    publish(pack.discharge_protect_sensor, pack.discharge_protect_raw);
+    publish(pack.discharge_protect_2_sensor, pack.discharge_protect_2_raw);
+    bool fault = pack.charge_alarm_raw || pack.discharge_alarm_raw || pack.charge_protect_raw ||
+                 pack.charge_protect_2_raw || pack.discharge_protect_raw || pack.discharge_protect_2_raw;
+    publish(pack.fault_binary_sensor, fault);
+    if (pack.design_capacity_raw > 0) {
+      float design_capacity = pack.design_capacity_raw * 0.001f;
+      publish(pack.design_capacity_sensor, design_capacity);
+      if (pack.full_capacity_raw > 0)
+        publish(pack.soh_sensor, pack.full_capacity_raw * 100.0f / pack.design_capacity_raw);
+    }
+    return;
+  }
+
+  if (start == 112) {
+    publish(pack.charge_voltage_limit_sensor, pack.charge_voltage_limit_raw * 0.1f);
+    publish(pack.discharge_voltage_limit_sensor, pack.discharge_voltage_limit_raw * 0.1f);
+    publish(pack.charge_current_limit_sensor, pack.charge_current_limit_raw * 0.1f);
+    publish(pack.discharge_current_limit_sensor, pack.discharge_current_limit_raw * 0.1f);
+    publish(pack.status_sensor, pack.status_raw);
+    publish(pack.charge_enabled_binary_sensor, (pack.status_raw & 0x80) != 0);
+    publish(pack.discharge_enabled_binary_sensor, (pack.status_raw & 0x40) != 0);
+    return;
+  }
+
+  if (start == 117) {
+    publish(pack.runtime_to_empty_sensor, pack.runtime_to_empty_raw);
+    if (pack.remaining_capacity_raw > 0)
+      publish(pack.remaining_capacity_sensor, pack.remaining_capacity_raw * 0.001f);
+  }
+}
+
+uint16_t FelicityRS485::crc16_(const uint8_t *data, size_t length) {
+  uint16_t crc = 0xFFFF;
+  for (size_t i = 0; i < length; i++) {
+    crc ^= data[i];
+    for (uint8_t bit = 0; bit < 8; bit++)
+      crc = (crc & 1) ? (crc >> 1) ^ 0xA001 : crc >> 1;
+  }
+  return crc;
+}
+
+}  // namespace felicity_rs485
+}  // namespace esphome
+

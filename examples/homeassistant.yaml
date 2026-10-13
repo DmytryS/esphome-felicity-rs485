@@ -1,0 +1,213 @@
+esphome:
+  name: inverterbattery
+  friendly_name: inverter+battery
+  min_version: 2026.4.0
+  name_add_mac_suffix: false
+
+esp32:
+  board: esp32dev
+  flash_size: 8MB
+  framework:
+    type: arduino
+
+logger:
+  level: DEBUG
+  baud_rate: 115200
+
+api:
+
+ota:
+  - platform: esphome
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+
+captive_portal:
+
+web_server:
+  port: 80
+
+time:
+  - platform: homeassistant
+    id: homeassistant_time
+
+external_components:
+  - source:
+      type: git
+      url: https://github.com/DmytryS/esphome-component-felicity-rs485
+      ref: main
+    components: [felicity_rs485]
+
+uart:
+  id: felicity_uart
+  tx_pin: GPIO22
+  rx_pin: GPIO21
+  baud_rate: 9600
+  data_bits: 8
+  parity: NONE
+  stop_bits: 1
+  rx_buffer_size: 256
+
+felicity_rs485:
+  id: felicity_bus
+  uart_id: felicity_uart
+  direction_pin: GPIO17
+  pack_addresses: [1, 2]
+  update_interval: 30s
+
+sensor:
+  - platform: uptime
+    name: "ESP Uptime"
+
+  - platform: felicity_rs485
+    felicity_rs485_id: felicity_bus
+    address: 1
+    voltage: {name: "Battery 1 Voltage"}
+    current: {name: "Battery 1 Current"}
+    charge_current: {name: "Battery 1 Charge Current"}
+    discharge_current: {name: "Battery 1 Discharge Current"}
+    power: {name: "Battery 1 Power"}
+    soc: {name: "Battery 1 SOC"}
+    soh: {name: "Battery 1 SOH"}
+    full_capacity: {name: "Battery 1 Full Capacity"}
+    design_capacity: {name: "Battery 1 Design Capacity"}
+    remaining_capacity: {name: "Battery 1 Remaining Capacity"}
+    temperature: {name: "Battery 1 Temperature"}
+    cell_count: {name: "Battery 1 Cell Count"}
+    temperature_sensor_count: {name: "Battery 1 Temperature Sensor Count"}
+    min_cell_voltage: {name: "Battery 1 Minimum Cell Voltage"}
+    max_cell_voltage: {name: "Battery 1 Maximum Cell Voltage"}
+    average_cell_voltage: {name: "Battery 1 Average Cell Voltage"}
+    cell_delta: {name: "Battery 1 Cell Delta"}
+    min_voltage_cell: {name: "Battery 1 Minimum Voltage Cell"}
+    max_voltage_cell: {name: "Battery 1 Maximum Voltage Cell"}
+    charge_voltage_limit: {name: "Battery 1 Charge Voltage Limit"}
+    discharge_voltage_limit: {name: "Battery 1 Discharge Voltage Limit"}
+    charge_current_limit: {name: "Battery 1 Charge Current Limit"}
+    discharge_current_limit: {name: "Battery 1 Discharge Current Limit"}
+    runtime_to_empty: {name: "Battery 1 Runtime To Empty"}
+    packs_online: {name: "Battery 1 Packs Online Raw"}
+    charge_alarm: {name: "Battery 1 Charge Alarm Raw"}
+    discharge_alarm: {name: "Battery 1 Discharge Alarm Raw"}
+    charge_protect: {name: "Battery 1 Charge Protect Raw"}
+    charge_protect_2: {name: "Battery 1 Charge Protect 2 Raw"}
+    discharge_protect: {name: "Battery 1 Discharge Protect Raw"}
+    discharge_protect_2: {name: "Battery 1 Discharge Protect 2 Raw"}
+    status: {name: "Battery 1 Status Raw"}
+    protocol_type: {name: "Battery 1 Protocol Type"}
+    protocol_version: {name: "Battery 1 Protocol Version"}
+    firmware_version: {name: "Battery 1 Firmware Version"}
+    hardware_version: {name: "Battery 1 Hardware Version"}
+    bus_errors: {name: "Battery 1 Bus Errors"}
+    cell_voltage_1: {name: "Battery 1 Cell 01"}
+    cell_voltage_2: {name: "Battery 1 Cell 02"}
+    cell_voltage_3: {name: "Battery 1 Cell 03"}
+    cell_voltage_4: {name: "Battery 1 Cell 04"}
+    cell_voltage_5: {name: "Battery 1 Cell 05"}
+    cell_voltage_6: {name: "Battery 1 Cell 06"}
+    cell_voltage_7: {name: "Battery 1 Cell 07"}
+    cell_voltage_8: {name: "Battery 1 Cell 08"}
+    cell_voltage_9: {name: "Battery 1 Cell 09"}
+    cell_voltage_10: {name: "Battery 1 Cell 10"}
+    cell_voltage_11: {name: "Battery 1 Cell 11"}
+    cell_voltage_12: {name: "Battery 1 Cell 12"}
+    cell_voltage_13: {name: "Battery 1 Cell 13"}
+    cell_voltage_14: {name: "Battery 1 Cell 14"}
+    cell_voltage_15: {name: "Battery 1 Cell 15"}
+    cell_voltage_16: {name: "Battery 1 Cell 16"}
+    temperature_sensor_1: {name: "Battery 1 Temperature 1"}
+    temperature_sensor_2: {name: "Battery 1 Temperature 2"}
+    temperature_sensor_3: {name: "Battery 1 Temperature 3"}
+    temperature_sensor_4: {name: "Battery 1 Temperature 4"}
+
+  - platform: felicity_rs485
+    felicity_rs485_id: felicity_bus
+    address: 2
+    voltage: {name: "Battery 2 Voltage"}
+    current: {name: "Battery 2 Current"}
+    charge_current: {name: "Battery 2 Charge Current"}
+    discharge_current: {name: "Battery 2 Discharge Current"}
+    power: {name: "Battery 2 Power"}
+    soc: {name: "Battery 2 SOC"}
+    soh: {name: "Battery 2 SOH"}
+    full_capacity: {name: "Battery 2 Full Capacity"}
+    design_capacity: {name: "Battery 2 Design Capacity"}
+    remaining_capacity: {name: "Battery 2 Remaining Capacity"}
+    temperature: {name: "Battery 2 Temperature"}
+    cell_count: {name: "Battery 2 Cell Count"}
+    temperature_sensor_count: {name: "Battery 2 Temperature Sensor Count"}
+    min_cell_voltage: {name: "Battery 2 Minimum Cell Voltage"}
+    max_cell_voltage: {name: "Battery 2 Maximum Cell Voltage"}
+    average_cell_voltage: {name: "Battery 2 Average Cell Voltage"}
+    cell_delta: {name: "Battery 2 Cell Delta"}
+    min_voltage_cell: {name: "Battery 2 Minimum Voltage Cell"}
+    max_voltage_cell: {name: "Battery 2 Maximum Voltage Cell"}
+    charge_voltage_limit: {name: "Battery 2 Charge Voltage Limit"}
+    discharge_voltage_limit: {name: "Battery 2 Discharge Voltage Limit"}
+    charge_current_limit: {name: "Battery 2 Charge Current Limit"}
+    discharge_current_limit: {name: "Battery 2 Discharge Current Limit"}
+    runtime_to_empty: {name: "Battery 2 Runtime To Empty"}
+    packs_online: {name: "Battery 2 Packs Online Raw"}
+    charge_alarm: {name: "Battery 2 Charge Alarm Raw"}
+    discharge_alarm: {name: "Battery 2 Discharge Alarm Raw"}
+    charge_protect: {name: "Battery 2 Charge Protect Raw"}
+    charge_protect_2: {name: "Battery 2 Charge Protect 2 Raw"}
+    discharge_protect: {name: "Battery 2 Discharge Protect Raw"}
+    discharge_protect_2: {name: "Battery 2 Discharge Protect 2 Raw"}
+    status: {name: "Battery 2 Status Raw"}
+    protocol_type: {name: "Battery 2 Protocol Type"}
+    protocol_version: {name: "Battery 2 Protocol Version"}
+    firmware_version: {name: "Battery 2 Firmware Version"}
+    hardware_version: {name: "Battery 2 Hardware Version"}
+    bus_errors: {name: "Battery 2 Bus Errors"}
+    cell_voltage_1: {name: "Battery 2 Cell 01"}
+    cell_voltage_2: {name: "Battery 2 Cell 02"}
+    cell_voltage_3: {name: "Battery 2 Cell 03"}
+    cell_voltage_4: {name: "Battery 2 Cell 04"}
+    cell_voltage_5: {name: "Battery 2 Cell 05"}
+    cell_voltage_6: {name: "Battery 2 Cell 06"}
+    cell_voltage_7: {name: "Battery 2 Cell 07"}
+    cell_voltage_8: {name: "Battery 2 Cell 08"}
+    cell_voltage_9: {name: "Battery 2 Cell 09"}
+    cell_voltage_10: {name: "Battery 2 Cell 10"}
+    cell_voltage_11: {name: "Battery 2 Cell 11"}
+    cell_voltage_12: {name: "Battery 2 Cell 12"}
+    cell_voltage_13: {name: "Battery 2 Cell 13"}
+    cell_voltage_14: {name: "Battery 2 Cell 14"}
+    cell_voltage_15: {name: "Battery 2 Cell 15"}
+    cell_voltage_16: {name: "Battery 2 Cell 16"}
+    temperature_sensor_1: {name: "Battery 2 Temperature 1"}
+    temperature_sensor_2: {name: "Battery 2 Temperature 2"}
+    temperature_sensor_3: {name: "Battery 2 Temperature 3"}
+    temperature_sensor_4: {name: "Battery 2 Temperature 4"}
+
+binary_sensor:
+  - platform: status
+    name: "ESPHome Status"
+
+  - platform: felicity_rs485
+    felicity_rs485_id: felicity_bus
+    address: 1
+    online: {name: "Battery 1 Online"}
+    charging: {name: "Battery 1 Charging"}
+    discharging: {name: "Battery 1 Discharging"}
+    charge_enabled: {name: "Battery 1 Charge Enabled"}
+    discharge_enabled: {name: "Battery 1 Discharge Enabled"}
+    fault: {name: "Battery 1 Fault"}
+
+  - platform: felicity_rs485
+    felicity_rs485_id: felicity_bus
+    address: 2
+    online: {name: "Battery 2 Online"}
+    charging: {name: "Battery 2 Charging"}
+    discharging: {name: "Battery 2 Discharging"}
+    charge_enabled: {name: "Battery 2 Charge Enabled"}
+    discharge_enabled: {name: "Battery 2 Discharge Enabled"}
+    fault: {name: "Battery 2 Fault"}
+
+text_sensor:
+  - platform: wifi_info
+    ip_address:
+      name: "ESP IP Address"
+
