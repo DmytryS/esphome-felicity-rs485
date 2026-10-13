@@ -22,6 +22,8 @@ The component exposes pack voltage, current-related values, SOC, capacity, cell 
 
 This project currently reads the batteries only. It does not pass data to the Deye inverter or make the inverter identify the batteries as Deye-compatible. Keep the inverter's existing battery communication wiring/configuration unchanged while testing this reader.
 
+See [`examples/felicity-to-deye.md`](examples/felicity-to-deye.md) for the recommended direct-protocol setup and the requirements for a future ESPHome bridge.
+
 ## USB-only test configuration
 
 [`felicity-rs485.yaml`](felicity-rs485.yaml) is the original local-component configuration for bench testing. It expects the `components` directory beside the YAML and does not enable Wi-Fi or Home Assistant API.
