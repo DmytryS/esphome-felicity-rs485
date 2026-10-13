@@ -1,6 +1,6 @@
 # Felicity Solar battery reader for ESPHome
 
-ESPHome firmware for reading two Felicity Solar 48 V batteries over the battery bank's RS485 bus. It polls Modbus addresses 1 and 2 and exposes telemetry in Home Assistant. It sends read requests only; it does not write settings to the batteries or emulate a Deye battery protocol.
+ESPHome firmware for reading two Felicity Solar 48 V batteries over the battery bank's RS485 bus. It polls Modbus addresses 1 and 2 and exposes telemetry in Home Assistant. An experimental, opt-in bridge can also translate the available pack data into Deye low-voltage CAN frames.
 
 ## Install in Home Assistant
 
@@ -20,9 +20,9 @@ The tested bus is 9600 baud, 8 data bits, no parity, 1 stop bit. The two respond
 
 The component exposes pack voltage, current-related values, SOC, capacity, cell voltages, temperatures, limits, status, and alarms when the corresponding register data is returned. The observed batteries reported SOC and telemetry, but their design-capacity/SOH registers were zero. In that case the component leaves SOH unavailable; it does not infer SOH from SOC or nominal capacity. Some register meanings/scalings can vary by firmware, so verify values against the battery display before relying on them for control.
 
-This project currently reads the batteries only. It does not pass data to the Deye inverter or make the inverter identify the batteries as Deye-compatible. Keep the inverter's existing battery communication wiring/configuration unchanged while testing this reader.
+The standard reader config only reads the batteries. The separate experimental bridge example is not yet validated with the exact Deye inverter firmware; review [`examples/felicity-to-deye.md`](examples/felicity-to-deye.md) before enabling it. SOH is unknown on the observed battery firmware because the design-capacity values were zero.
 
-See [`examples/felicity-to-deye.md`](examples/felicity-to-deye.md) for the recommended direct-protocol setup and the requirements for a future ESPHome bridge.
+See [`examples/felicity-to-deye.md`](examples/felicity-to-deye.md) for direct-protocol guidance, bridge behavior, and limitations.
 
 ## USB-only test configuration
 

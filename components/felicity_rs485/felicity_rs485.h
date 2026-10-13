@@ -5,6 +5,7 @@
 #include "esphome/components/uart/uart.h"
 #include "esphome/components/sensor/sensor.h"
 #include "esphome/components/binary_sensor/binary_sensor.h"
+#include "esphome/components/canbus/canbus.h"
 
 #include <cstdint>
 #include <vector>
@@ -48,6 +49,12 @@ struct FelicityPack {
   uint32_t remaining_capacity_raw{0};
   uint32_t bus_errors{0};
   uint8_t consecutive_status_failures{0};
+  uint32_t telemetry_updated_at{0};
+  uint32_t alarms_updated_at{0};
+  uint32_t limits_updated_at{0};
+  bool telemetry_valid{false};
+  bool alarms_valid{false};
+  bool limits_valid{false};
 
   sensor::Sensor *voltage_sensor{nullptr};
   sensor::Sensor *current_sensor{nullptr};
@@ -111,6 +118,8 @@ class FelicityRS485 : public PollingComponent, public uart::UARTDevice {
   void dump_config() override;
 
   void set_direction_pin(InternalGPIOPin *pin) { this->direction_pin_ = pin; }
+  void set_canbus(canbus::Canbus *canbus) { this->canbus_ = canbus; }
+  void set_bridge_enabled(bool enabled) { this->bridge_enabled_ = enabled; }
   void add_pack(uint8_t address);
 
 #define FELICITY_DECLARE_SENSOR_SETTER(NAME, MEMBER) \
@@ -189,9 +198,13 @@ class FelicityRS485 : public PollingComponent, public uart::UARTDevice {
   void finish_request_(bool success);
   void apply_registers_(FelicityPack &pack, uint16_t start, const std::vector<uint16_t> &registers);
   void publish_block_(FelicityPack &pack, uint16_t start);
+  void transmit_deye_frames_();
   static uint16_t crc16_(const uint8_t *data, size_t length);
 
   InternalGPIOPin *direction_pin_{nullptr};
+  canbus::Canbus *canbus_{nullptr};
+  bool bridge_enabled_{false};
+  uint32_t last_can_tx_at_{0};
   std::vector<FelicityPack> packs_;
   std::vector<uint8_t> rx_buffer_;
   size_t pack_index_{0};

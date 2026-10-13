@@ -1,6 +1,7 @@
 import esphome.codegen as cg
 import esphome.config_validation as cv
 from esphome import pins
+from esphome.components import canbus
 from esphome.components import uart
 from esphome.const import CONF_ID
 
@@ -10,6 +11,8 @@ AUTO_LOAD = ["sensor", "binary_sensor"]
 
 CONF_DIRECTION_PIN = "direction_pin"
 CONF_PACK_ADDRESSES = "pack_addresses"
+CONF_CANBUS_ID = "canbus_id"
+CONF_DEYE_CAN_BRIDGE = "deye_can_bridge"
 
 felicity_rs485_ns = cg.esphome_ns.namespace("felicity_rs485")
 FelicityRS485 = felicity_rs485_ns.class_(
@@ -32,6 +35,8 @@ CONFIG_SCHEMA = (
             cv.GenerateID(): cv.declare_id(FelicityRS485),
             cv.Required(CONF_DIRECTION_PIN): pins.gpio_output_pin_schema,
             cv.Required(CONF_PACK_ADDRESSES): _addresses,
+            cv.Optional(CONF_CANBUS_ID): cv.use_id(canbus.CanbusComponent),
+            cv.Optional(CONF_DEYE_CAN_BRIDGE, default=False): cv.boolean,
         }
     )
     .extend(cv.polling_component_schema("10s"))
@@ -45,6 +50,10 @@ async def to_code(config):
     await uart.register_uart_device(var, config)
     pin = await cg.gpio_pin_expression(config[CONF_DIRECTION_PIN])
     cg.add(var.set_direction_pin(pin))
+    if CONF_CANBUS_ID in config:
+        canbus_var = await cg.get_variable(config[CONF_CANBUS_ID])
+        cg.add(var.set_canbus(canbus_var))
+    cg.add(var.set_bridge_enabled(config[CONF_DEYE_CAN_BRIDGE]))
     for address in config[CONF_PACK_ADDRESSES]:
         cg.add(var.add_pack(address))
 

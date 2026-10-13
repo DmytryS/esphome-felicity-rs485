@@ -12,6 +12,8 @@ static const char *const TAG = "felicity_rs485";
 static constexpr uint32_t RESPONSE_TIMEOUT_MS = 500;
 static constexpr uint32_t FRAME_SILENCE_MS = 20;
 static constexpr uint32_t INTER_FRAME_GAP_MS = 120;
+static constexpr uint32_t CAN_TX_PERIOD_MS = 1000;
+static constexpr uint32_t BRIDGE_DATA_MAX_AGE_MS = 60000;
 
 static const FelicityRS485::Block BLOCKS[] = {
     {"identity", 1, 6},
@@ -110,6 +112,7 @@ void FelicityRS485::update() {
 }
 
 void FelicityRS485::loop() {
+  this->transmit_deye_frames_();
   if (!this->busy_)
     return;
 
@@ -250,8 +253,127 @@ bool FelicityRS485::parse_response_(FelicityPack &pack, const Block &block) {
   if (block.start >= 117 && block.start <= 119)
     return true;  // Probe individually; these registers are undocumented on this battery firmware.
   this->apply_registers_(pack, block.start, registers);
+  if (block.start == 37) {
+    pack.telemetry_valid = true;
+    pack.telemetry_updated_at = millis();
+  } else if (block.start == 54) {
+    pack.alarms_valid = true;
+    pack.alarms_updated_at = millis();
+  } else if (block.start == 112) {
+    pack.limits_valid = true;
+    pack.limits_updated_at = millis();
+  }
   this->publish_block_(pack, block.start);
   return true;
+}
+
+void FelicityRS485::transmit_deye_frames_() {
+  if (!this->bridge_enabled_ || this->canbus_ == nullptr || this->packs_.size() != 2)
+    return;
+  const uint32_t now = millis();
+  if (now - this->last_can_tx_at_ < CAN_TX_PERIOD_MS)
+    return;
+
+  // Require recent telemetry, limits, and alarm words from both packs. Never
+  // keep presenting old BMS limits to the inverter after RS485 comms fail.
+  float total_capacity = 0.0f;
+  float weighted_soc = 0.0f;
+  float total_current = 0.0f;
+  float charge_current_limit = 0.0f;
+  float discharge_current_limit = 0.0f;
+  float charge_voltage_limit = 1000.0f;
+  float discharge_voltage_limit = 1000.0f;
+  float total_voltage = 0.0f;
+  float total_temperature = 0.0f;
+  uint8_t temperature_count = 0;
+  bool any_bms_fault = false;
+  for (const auto &pack : this->packs_) {
+    if (!pack.telemetry_valid || !pack.alarms_valid || !pack.limits_valid ||
+        pack.consecutive_status_failures >= 3 ||
+        now - pack.telemetry_updated_at > BRIDGE_DATA_MAX_AGE_MS ||
+        now - pack.alarms_updated_at > BRIDGE_DATA_MAX_AGE_MS ||
+        now - pack.limits_updated_at > BRIDGE_DATA_MAX_AGE_MS) {
+      return;
+    }
+    const float capacity = pack.full_capacity_raw * 0.001f;
+    if (capacity <= 0.0f || pack.soc_raw > 100)
+      return;
+    const float voltage_scale = pack.voltage_raw >= 10000 ? 0.001f : 0.1f;
+    const float voltage = pack.voltage_raw * voltage_scale;
+    if (voltage < 40.0f || voltage > 65.0f)
+      return;
+    total_capacity += capacity;
+    total_voltage += voltage;
+    weighted_soc += capacity * pack.soc_raw;
+    total_current += (pack.charge_current_raw - std::abs(static_cast<int16_t>(pack.discharge_current_raw))) * 0.1f;
+    charge_current_limit += pack.charge_current_limit_raw * 0.1f;
+    discharge_current_limit += pack.discharge_current_limit_raw * 0.1f;
+    charge_voltage_limit = std::min(charge_voltage_limit, pack.charge_voltage_limit_raw * 0.1f);
+    discharge_voltage_limit = std::min(discharge_voltage_limit, pack.discharge_voltage_limit_raw * 0.1f);
+    for (uint8_t i = 0; i < std::min<uint16_t>(pack.temperature_count, FELICITY_MAX_TEMPERATURES); i++) {
+      float temperature = temperature_c(pack.temperatures_raw[i]);
+      if (!std::isnan(temperature) && temperature >= -30.0f && temperature <= 100.0f) {
+        total_temperature += temperature;
+        temperature_count++;
+      }
+    }
+    any_bms_fault |= pack.charge_alarm_raw || pack.discharge_alarm_raw || pack.charge_protect_raw ||
+                     pack.charge_protect_2_raw || pack.discharge_protect_raw || pack.discharge_protect_2_raw;
+  }
+  if (total_capacity <= 0.0f || temperature_count == 0 || charge_voltage_limit <= 0.0f ||
+      discharge_voltage_limit <= 0.0f)
+    return;
+
+  auto write_u16 = [](std::vector<uint8_t> &data, size_t offset, int32_t value) {
+    uint16_t v = static_cast<uint16_t>(std::max<int32_t>(0, std::min<int32_t>(65535, value)));
+    data[offset] = v & 0xFF;
+    data[offset + 1] = v >> 8;
+  };
+  auto send = [this](uint32_t id, const std::vector<uint8_t> &data) {
+    auto result = this->canbus_->send_data(id, false, false, data);
+    if (result != canbus::ERROR_OK)
+      ESP_LOGW(TAG, "Deye CAN TX 0x%03X failed (%d)", static_cast<unsigned>(id), static_cast<int>(result));
+  };
+
+  std::vector<uint8_t> limits(8, 0);
+  write_u16(limits, 0, std::lround(charge_voltage_limit * 10));
+  write_u16(limits, 2, std::lround(charge_current_limit * 10));
+  write_u16(limits, 4, std::lround(discharge_current_limit * 10));
+  write_u16(limits, 6, std::lround(discharge_voltage_limit * 10));
+  send(0x351, limits);
+
+  std::vector<uint8_t> soc_soh(8, 0);
+  write_u16(soc_soh, 0, std::lround(weighted_soc / total_capacity));
+  // Felicity returned zero design-capacity registers, so SOH is unknown.
+  // Keep the protocol field explicitly zero rather than making up a value.
+  write_u16(soc_soh, 2, 0);
+  send(0x355, soc_soh);
+
+  std::vector<uint8_t> telemetry(8, 0);
+  // Deye's 0x356 voltage field is in 0.01 V units.
+  write_u16(telemetry, 0, std::lround((total_voltage / this->packs_.size()) * 100.0f));
+  int32_t current_deciamps = std::lround(total_current * 10);
+  uint16_t current_word = static_cast<uint16_t>(static_cast<int16_t>(std::max<int32_t>(-32768, std::min<int32_t>(32767, current_deciamps))));
+  telemetry[2] = current_word & 0xFF;
+  telemetry[3] = current_word >> 8;
+  int16_t temp_degrees = static_cast<int16_t>(std::lround((total_temperature / temperature_count) * 10));
+  telemetry[4] = static_cast<uint8_t>(temp_degrees & 0xFF);
+  telemetry[5] = static_cast<uint8_t>((static_cast<uint16_t>(temp_degrees) >> 8) & 0xFF);
+  send(0x356, telemetry);
+
+  // We do not yet have a verified bit-by-bit Felicity-to-Deye alarm mapping.
+  // Assert only the generic system-error bit when any raw BMS alarm/protection is active.
+  std::vector<uint8_t> alarms(8, 0);
+  alarms[1] = any_bms_fault ? 0x01 : 0x00;
+  alarms[4] = 'N';
+  alarms[5] = 'P';
+  alarms[6] = static_cast<uint8_t>(this->packs_.size());
+  send(0x359, alarms);
+
+  std::vector<uint8_t> brand{'F', 'e', 'l', 'i', 'c', 'i', 't', 'y'};
+  send(0x35E, brand);
+
+  this->last_can_tx_at_ = now;
 }
 
 void FelicityRS485::finish_request_(bool success) {
