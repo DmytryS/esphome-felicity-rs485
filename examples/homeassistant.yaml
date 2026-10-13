@@ -33,7 +33,7 @@ time:
 external_components:
   - source:
       type: git
-      url: https://github.com/DmytryS/esphome-component-felicity-rs485
+      url: https://github.com/DmytryS/esphome-felicity-rs485
       ref: main
     components: [felicity_rs485]
 
